@@ -1,0 +1,9 @@
+project_name: buffyverse
+source_directories:
+  canonical:
+    - ../Buffy shooting scripts
+    - ../angel_shooting_scripts
+  fanfiction: ../kitten_fanfics
+storage_directory: ./data
+embedding_model: qwen3-embedding:0.6b
+ollama_url: http://127.0.0.1:11434

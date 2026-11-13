@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scriptlab"
+version = "0.1.0"
+description = "A local, evidence-first script and fanfiction search prototype"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+vectors = [
+    "chromadb>=1.0,<2",
+]
+
+[project.scripts]
+scriptlab = "scriptlab.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+scriptlab = ["config.example.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
