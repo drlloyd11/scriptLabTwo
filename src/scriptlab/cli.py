@@ -21,6 +21,7 @@ from scriptlab.database import (
     search_chunks,
     validate_database,
 )
+from scriptlab.timing import SearchTimings, measure
 from scriptlab.vectors import VectorIndexError, index_chunks, search_vector_chunks
 
 
@@ -43,6 +44,24 @@ def _reciprocal_rank_fusion(fts_results, vector_results, limit: int, rank_consta
     return results
 
 
+def _print_search_timings(
+    timings: Optional[SearchTimings], started: float, actual_mode: str
+) -> None:
+    if timings is None:
+        return
+    timings.seconds["retrieval.total"] = time.perf_counter() - started
+    print(
+        "Search timings (seconds, nested stages overlap; actual_mode={}):".format(
+            actual_mode
+        ),
+        file=sys.stderr,
+    )
+    for name, elapsed in timings.seconds.items():
+        print("  {}: {:.3f}".format(name, elapsed), file=sys.stderr)
+    for name, count in timings.counts.items():
+        print("  {}: {}".format(name, count), file=sys.stderr)
+
+
 def _add_search_options(parser: argparse.ArgumentParser, default_mode: str) -> None:
     parser.add_argument(
         "--mode", choices=("fts", "semantic", "hybrid"), default=default_mode
@@ -54,6 +73,11 @@ def _add_search_options(parser: argparse.ArgumentParser, default_mode: str) -> N
     )
     parser.add_argument("--work-id")
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument(
+        "--timings",
+        action="store_true",
+        help="report per-stage search timings and candidate counts to stderr",
+    )
     parser.add_argument(
         "--fallback-to-fts",
         action="store_true",
@@ -391,6 +415,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 search_options.extend(("--work-id", args.work_id))
             if args.fallback_to_fts:
                 search_options.append("--fallback-to-fts")
+            if args.timings:
+                search_options.append("--timings")
             exit_code = 0
             while True:
                 try:
@@ -409,36 +435,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if main(search_options + ["--", query]) != 0:
                     exit_code = 1
 
+        timings = SearchTimings() if args.timings else None
+        timing_options = {"timings": timings} if timings is not None else {}
+        started = time.perf_counter() if timings is not None else 0.0
         actual_mode = args.mode
         coverage = None
         if args.mode == "fts":
             try:
-                results = search_chunks(
-                    config,
-                    args.query,
-                    source_class=args.source,
-                    work_id=args.work_id,
-                    limit=args.limit,
-                )
+                with measure(timings, "fts.total"):
+                    results = search_chunks(
+                        config,
+                        args.query,
+                        source_class=args.source,
+                        work_id=args.work_id,
+                        limit=args.limit,
+                        **timing_options
+                    )
             except (PersistenceError, ValueError) as exc:
                 print("scriptlab: error: {}".format(exc), file=sys.stderr)
+                _print_search_timings(timings, started, "failed")
                 return 2
         else:
             try:
-                vector_result = search_vector_chunks(
-                    config,
-                    args.query,
-                    source_class=args.source,
-                    work_id=args.work_id,
-                    limit=(
-                        args.limit
-                        if args.mode == "semantic"
-                        else max(args.limit * 10, args.limit)
-                    ),
-                )
+                with measure(timings, "vector.total"):
+                    vector_result = search_vector_chunks(
+                        config,
+                        args.query,
+                        source_class=args.source,
+                        work_id=args.work_id,
+                        limit=(
+                            args.limit
+                            if args.mode == "semantic"
+                            else max(args.limit * 10, args.limit)
+                        ),
+                        **timing_options
+                    )
             except (PersistenceError, VectorIndexError, ValueError) as exc:
                 if not args.fallback_to_fts:
                     print("scriptlab: error: {}".format(exc), file=sys.stderr)
+                    _print_search_timings(timings, started, "failed")
                     return 2
                 print(
                     "Vector search unavailable: {}; using FTS by explicit request.".format(
@@ -448,15 +483,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 actual_mode = "fts"
                 try:
-                    results = search_chunks(
-                        config,
-                        args.query,
-                        source_class=args.source,
-                        work_id=args.work_id,
-                        limit=args.limit,
-                    )
+                    with measure(timings, "fts.total"):
+                        results = search_chunks(
+                            config,
+                            args.query,
+                            source_class=args.source,
+                            work_id=args.work_id,
+                            limit=args.limit,
+                            **timing_options
+                        )
                 except (PersistenceError, ValueError) as fts_error:
                     print("scriptlab: error: {}".format(fts_error), file=sys.stderr)
+                    _print_search_timings(timings, started, "failed")
                     return 2
             else:
                 coverage = vector_result["coverage"]
@@ -465,22 +503,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     results = vector_results[: args.limit]
                 else:
                     try:
-                        fts_results = search_chunks(
-                            config,
-                            args.query,
-                            source_class=args.source,
-                            work_id=args.work_id,
-                            limit=max(args.limit * 10, args.limit),
-                            ready_index_version=vector_result["index_version"],
-                            require_all_terms=False,
-                        )
+                        with measure(timings, "fts.total"):
+                            fts_results = search_chunks(
+                                config,
+                                args.query,
+                                source_class=args.source,
+                                work_id=args.work_id,
+                                limit=max(args.limit * 10, args.limit),
+                                ready_index_version=vector_result["index_version"],
+                                require_all_terms=False,
+                                **timing_options
+                            )
                     except (PersistenceError, ValueError) as exc:
                         print("scriptlab: error: {}".format(exc), file=sys.stderr)
+                        _print_search_timings(timings, started, "failed")
                         return 2
-                    results = _reciprocal_rank_fusion(
-                        fts_results, vector_results, args.limit
-                    )
+                    with measure(timings, "fusion"):
+                        results = _reciprocal_rank_fusion(
+                            fts_results, vector_results, args.limit
+                        )
 
+        _print_search_timings(timings, started, actual_mode)
         print(
             "Search mode: {}; source: {}; results: {}; requested_mode={}; actual_mode={}".format(
                 args.mode, args.source, len(results), args.mode, actual_mode

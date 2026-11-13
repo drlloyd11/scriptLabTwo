@@ -111,6 +111,26 @@ def test_search_session_reports_failure_and_continues_until_eof(monkeypatch, cap
     assert "requested_mode=semantic; actual_mode=semantic" in output.out
 
 
+def test_search_session_reports_timings_for_each_query(monkeypatch, capsys):
+    queries = iter(["first question", "second question", "/quit"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(queries))
+    monkeypatch.setattr(cli_module, "load_config", lambda path: object())
+
+    def fake_search(config, query, **kwargs):
+        assert kwargs["timings"] is not None
+        return {
+            "results": [],
+            "index_version": "test-version",
+            "coverage": {"documents_ready": 1, "documents_total": 1},
+        }
+
+    monkeypatch.setattr(cli_module, "search_vector_chunks", fake_search)
+    assert main(["search-session", "--timings"]) == 0
+    output = capsys.readouterr()
+    assert output.err.count("Search timings") == 2
+    assert output.err.count("retrieval.total:") == 2
+
+
 def test_rrf_combines_ranked_results_and_deduplicates_chunks():
     fts_results = [{"chunk_id": "shared"}, {"chunk_id": "fts-only"}]
     vector_results = [{"chunk_id": "shared"}, {"chunk_id": "vector-only"}]
@@ -164,12 +184,16 @@ def test_semantic_search_requires_explicit_fts_fallback(tmp_path, capsys, monkey
             "--mode",
             "semantic",
             "--fallback-to-fts",
+            "--timings",
         ]
     ) == 0
     output = capsys.readouterr()
     assert "requested_mode=semantic; actual_mode=fts" in output.out
     assert "episode.txt [canonical]" in output.out
     assert "using FTS by explicit request" in output.err
+    assert "actual_mode=fts" in output.err
+    assert "vector.total:" in output.err
+    assert "fts.sql:" in output.err
 
 def test_index_arguments_support_batches_limits_and_rebuild():
     args = build_parser().parse_args(

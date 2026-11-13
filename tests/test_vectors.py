@@ -6,8 +6,17 @@ from urllib.error import HTTPError
 
 import pytest
 
+import scriptlab.database as database_module
+import scriptlab.cli as cli_module
 from scriptlab.config import load_config
-from scriptlab.database import import_sources, parse_documents, get_status, search_chunks
+from scriptlab.database import (
+    get_status,
+    import_sources,
+    initialize_database,
+    parse_documents,
+    search_chunks,
+)
+from scriptlab.timing import SearchTimings
 import scriptlab.vectors as vector_module
 from scriptlab.vectors import (
     OllamaEmbeddingProvider,
@@ -393,6 +402,265 @@ def test_semantic_search_uses_sqlite_source_work_and_readiness_filters(tmp_path)
     assert {result["source_class"] for result in hybrid_candidates} == {
         "canonical"
     }
+
+
+@pytest.mark.parametrize("incomplete", ["failed", "missing", "null_chunk_id"])
+def test_fts_rejects_document_with_incomplete_nonmatching_chunk(tmp_path, incomplete):
+    config = make_config(tmp_path)
+    indexed = index_chunks(
+        config,
+        embedding_provider=FakeEmbeddingProvider(),
+        collection_factory=FakeCollectionFactory(),
+    )
+    expected = search_chunks(config, "hidden")
+    assert expected
+    assert search_chunks(config, "hidden", ready_index_version=indexed.index_version) == expected
+
+    with sqlite3.connect(config.storage_directory / "scriptlab.sqlite3") as connection:
+        chunk_id = connection.execute(
+            "SELECT chunk_id FROM chunks WHERE chunk_text NOT LIKE '%hidden%' LIMIT 1"
+        ).fetchone()[0]
+        if incomplete == "failed":
+            connection.execute(
+                "UPDATE embedding_jobs SET status = 'failed' "
+                "WHERE chunk_id = ? AND index_version = ?",
+                (chunk_id, indexed.index_version),
+            )
+        elif incomplete == "missing":
+            connection.execute(
+                "DELETE FROM embedding_jobs WHERE chunk_id = ? AND index_version = ?",
+                (chunk_id, indexed.index_version),
+            )
+        else:
+            connection.execute(
+                "UPDATE chunks SET chunk_id = NULL WHERE chunk_id = ?", (chunk_id,)
+            )
+
+    assert search_chunks(config, "hidden")
+    assert not search_chunks(config, "hidden", ready_index_version=indexed.index_version)
+
+
+def _assert_readiness_counts_match_jobs(connection):
+    actual_chunks = connection.execute(
+        "SELECT document_id, chunk_count FROM document_chunk_counts WHERE chunk_count > 0 "
+        "ORDER BY document_id"
+    ).fetchall()
+    expected_chunks = connection.execute(
+        "SELECT document_id, COUNT(*) FROM chunks GROUP BY document_id ORDER BY document_id"
+    ).fetchall()
+    actual_ready = connection.execute(
+        "SELECT index_version, document_id, ready_count FROM document_index_ready_counts "
+        "WHERE ready_count > 0 ORDER BY index_version, document_id"
+    ).fetchall()
+    expected_ready = connection.execute(
+        "SELECT j.index_version, c.document_id, COUNT(*) FROM embedding_jobs AS j "
+        "JOIN chunks AS c ON c.chunk_id = j.chunk_id WHERE j.status = 'ready' "
+        "GROUP BY j.index_version, c.document_id ORDER BY j.index_version, c.document_id"
+    ).fetchall()
+    assert actual_chunks == expected_chunks
+    assert actual_ready == expected_ready
+
+
+def test_readiness_counts_follow_jobs_chunks_and_rollbacks(tmp_path):
+    config = make_config(tmp_path)
+    indexed = index_chunks(
+        config,
+        embedding_provider=FakeEmbeddingProvider(),
+        collection_factory=FakeCollectionFactory(),
+    )
+    path = config.storage_directory / "scriptlab.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO vector_indexes VALUES (?, ?, ?, 'retired', ?, ?)",
+            ("other", "model", "other-collection", "now", "now"),
+        )
+        chunk_id = connection.execute("SELECT chunk_id FROM chunks LIMIT 1").fetchone()[0]
+        connection.execute(
+            "INSERT INTO embedding_jobs VALUES (?, 'other', 'ready', NULL, 'now')",
+            (chunk_id,),
+        )
+        connection.commit()
+        _assert_readiness_counts_match_jobs(connection)
+
+        connection.execute(
+            "UPDATE embedding_jobs SET status = 'failed' WHERE chunk_id = ? AND index_version = ?",
+            (chunk_id, indexed.index_version),
+        )
+        _assert_readiness_counts_match_jobs(connection)
+        connection.rollback()
+        _assert_readiness_counts_match_jobs(connection)
+
+        connection.execute(
+            "DELETE FROM embedding_jobs WHERE chunk_id = ? AND index_version = ?",
+            (chunk_id, indexed.index_version),
+        )
+        _assert_readiness_counts_match_jobs(connection)
+        connection.execute(
+            "INSERT INTO embedding_jobs VALUES (?, ?, 'ready', NULL, 'now')",
+            (chunk_id, indexed.index_version),
+        )
+        _assert_readiness_counts_match_jobs(connection)
+
+        connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (chunk_id,))
+        _assert_readiness_counts_match_jobs(connection)
+        connection.execute(
+            "INSERT INTO chunks (chunk_id, document_id, chunk_type, start_offset, end_offset, "
+            "chunk_text, chunker_version, chunk_ordinal) "
+            "SELECT 'new-chunk', document_id, chunk_type, start_offset, end_offset, "
+            "chunk_text, chunker_version, chunk_ordinal + 1000 FROM chunks LIMIT 1"
+        )
+        _assert_readiness_counts_match_jobs(connection)
+    assert not search_chunks(config, "hidden", ready_index_version="unknown-version")
+
+
+def test_v5_readiness_migration_preserves_existing_index_state(tmp_path):
+    config = make_config(tmp_path)
+    indexed = index_chunks(
+        config,
+        embedding_provider=FakeEmbeddingProvider(),
+        collection_factory=FakeCollectionFactory(),
+    )
+    path = config.storage_directory / "scriptlab.sqlite3"
+    with sqlite3.connect(path) as connection:
+        chunk_id = connection.execute("SELECT chunk_id FROM chunks LIMIT 1").fetchone()[0]
+        connection.execute(
+            "UPDATE embedding_jobs SET status = 'failed' WHERE chunk_id = ?",
+            (chunk_id,),
+        )
+        for name, in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE '%readiness%'"
+        ).fetchall():
+            connection.execute('DROP TRIGGER "{}"'.format(name))
+        connection.execute("DROP TABLE document_index_ready_counts")
+        connection.execute("DROP TABLE document_chunk_counts")
+        connection.execute("PRAGMA user_version = 5")
+
+    initialize_database(config)
+    with sqlite3.connect(path) as connection:
+        _assert_readiness_counts_match_jobs(connection)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert get_status(config)["vector_index"]["documents_ready"] == 0
+    assert not search_chunks(config, "hidden", ready_index_version=indexed.index_version)
+
+
+def test_reparse_marks_document_incomplete_until_reindexed(tmp_path):
+    config = make_config(tmp_path)
+    provider = FakeEmbeddingProvider()
+    collections = FakeCollectionFactory()
+    indexed = index_chunks(
+        config, embedding_provider=provider, collection_factory=collections
+    )
+    assert search_chunks(config, "hidden", ready_index_version=indexed.index_version)
+
+    assert not parse_documents(config, chunker_version="replacement").errors
+    assert not search_chunks(config, "hidden", ready_index_version=indexed.index_version)
+    assert get_status(config)["vector_index"]["documents_ready"] == 0
+
+    resumed = index_chunks(
+        config, embedding_provider=provider, collection_factory=collections
+    )
+    assert resumed.index_ready
+    assert resumed.index_version == indexed.index_version
+    assert search_chunks(config, "hidden", ready_index_version=indexed.index_version)
+
+
+def test_hybrid_timings_preserve_results_and_show_search_stages(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    provider = FakeEmbeddingProvider()
+    collections = FakeCollectionFactory()
+    index_chunks(config, embedding_provider=provider, collection_factory=collections)
+    monkeypatch.setattr(cli_module, "load_config", lambda path: config)
+
+    def search_with_fakes(config, query, **kwargs):
+        return search_vector_chunks(
+            config,
+            query,
+            embedding_provider=provider,
+            collection_factory=collections,
+            **kwargs
+        )
+
+    monkeypatch.setattr(cli_module, "search_vector_chunks", search_with_fakes)
+    command = ["search", "hidden book", "--mode", "hybrid", "--limit", "1"]
+    assert cli_module.main(command) == 0
+    baseline = capsys.readouterr()
+    assert baseline.err == ""
+    assert cli_module.main(command + ["--timings"]) == 0
+    measured = capsys.readouterr()
+
+    assert measured.out == baseline.out
+    for label in (
+        "vector.status:", "vector.collection_open:", "vector.collection_count:",
+        "vector.embedding:", "vector.query:", "vector.sqlite_lookup:",
+        "vector.citations:", "vector.validation:", "vector.total:",
+        "fts.sql:", "fts.citations:", "fts.total:", "fusion:",
+        "retrieval.total:", "vector.query_calls: 1", "vector.requested_candidates:",
+        "vector.returned_candidates:", "vector.validated_candidates:",
+        "fts.candidates:",
+    ):
+        assert label in measured.err
+
+
+def test_vector_timings_accumulate_candidate_retries(tmp_path):
+    config = make_config(tmp_path)
+    provider = FakeEmbeddingProvider()
+    collections = FakeCollectionFactory()
+    index = index_chunks(
+        config, embedding_provider=provider, collection_factory=collections
+    )
+    collection_name = next(row[2] for row in _index_rows(config) if row[0] == index.index_version)
+    collection = collections.collections[collection_name]
+    for number in range(15):
+        collection.records["aaa-stale-{:02d}".format(number)] = ("stale", [1.0, 0.0], {})
+    timings = SearchTimings()
+
+    result = search_vector_chunks(
+        config, "hidden book", limit=1, embedding_provider=provider,
+        collection_factory=collections, timings=timings,
+    )
+
+    assert len(result["results"]) == 1
+    assert timings.counts["vector.query_calls"] == 2
+    assert timings.counts["vector.requested_candidates"] == 10 + min(20, collection.count())
+    assert timings.counts["vector.returned_candidates"] == 10 + min(20, collection.count())
+    assert timings.counts["vector.validated_candidates"] == 1
+
+
+def test_search_formats_only_requested_valid_candidates(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    provider = FakeEmbeddingProvider()
+    collections = FakeCollectionFactory()
+    index = index_chunks(
+        config,
+        embedding_provider=provider,
+        collection_factory=collections,
+    )
+    collection_name = next(row[2] for row in _index_rows(config) if row[0] == index.index_version)
+    collection = collections.collections[collection_name]
+    collection.records["aaa-stale"] = ("stale", [1.0, 0.0], {})
+    expected_id = min(chunk_id for chunk_id in collection.records if chunk_id != "aaa-stale")
+    formatted_counts = []
+    original_format = database_module._format_chunk_rows
+
+    def track_format(connection, rows):
+        formatted_counts.append(len(rows))
+        return original_format(connection, rows)
+
+    monkeypatch.setattr(database_module, "_format_chunk_rows", track_format)
+    result = search_vector_chunks(
+        config,
+        "hidden book",
+        limit=1,
+        embedding_provider=provider,
+        collection_factory=collections,
+    )
+
+    assert [item["chunk_id"] for item in result["results"]] == [expected_id]
+    assert result["results"][0]["rank"] == 2
+    assert result["results"][0]["spans"]
+    assert formatted_counts == [1]
 
 
 def test_repeated_provider_failures_stop_early_and_remain_resumable(tmp_path):

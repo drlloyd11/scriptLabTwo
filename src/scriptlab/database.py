@@ -29,11 +29,21 @@ from scriptlab.parser import (
     parse_document,
     validate_parse_result,
 )
+from scriptlab.timing import SearchTimings, measure
 
 
 DATABASE_FILENAME = "scriptlab.sqlite3"
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _ID_NAMESPACE = uuid.UUID("3c1dc0d2-f3a9-4c0f-b980-c1bd7cd12489")
+_READY_DOCUMENT_SQL = """
+    EXISTS (
+        SELECT 1 FROM document_chunk_counts AS dc
+        JOIN document_index_ready_counts AS dr
+          ON dr.document_id = dc.document_id AND dr.index_version = ?
+        WHERE dc.document_id = d.document_id
+          AND dc.chunk_count > 0 AND dr.ready_count = dc.chunk_count
+    )
+"""
 
 
 class PersistenceError(RuntimeError):
@@ -137,6 +147,9 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     if version == 4:
         _migrate_v4_to_v5(connection)
         version = 5
+    if version == 5:
+        _migrate_v5_to_v6(connection)
+        version = 6
     if version != _SCHEMA_VERSION:
         raise PersistenceError(
             "Unsupported database schema version {}.".format(version)
@@ -402,6 +415,120 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version == 6:
+            connection.commit()
+            return
+        if version != 5:
+            raise PersistenceError(
+                "Cannot migrate readiness counts from schema version {}.".format(version)
+            )
+        connection.execute(
+            """
+            CREATE TABLE document_chunk_counts (
+                document_id TEXT NOT NULL PRIMARY KEY
+                    REFERENCES documents(document_id) ON DELETE CASCADE,
+                chunk_count INTEGER NOT NULL CHECK (chunk_count >= 0)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE document_index_ready_counts (
+                index_version TEXT NOT NULL
+                    REFERENCES vector_indexes(index_version) ON DELETE CASCADE,
+                document_id TEXT NOT NULL
+                    REFERENCES documents(document_id) ON DELETE CASCADE,
+                ready_count INTEGER NOT NULL CHECK (ready_count >= 0),
+                PRIMARY KEY (index_version, document_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO document_chunk_counts "
+            "SELECT document_id, COUNT(*) FROM chunks GROUP BY document_id"
+        )
+        connection.execute(
+            """
+            INSERT INTO document_index_ready_counts
+            SELECT j.index_version, c.document_id, COUNT(*)
+            FROM embedding_jobs AS j
+            JOIN chunks AS c ON c.chunk_id = j.chunk_id
+            WHERE j.status = 'ready'
+            GROUP BY j.index_version, c.document_id
+            """
+        )
+        remove_chunk = """
+            UPDATE document_index_ready_counts SET ready_count = ready_count - 1
+            WHERE document_id = OLD.document_id AND index_version IN (
+                SELECT index_version FROM embedding_jobs
+                WHERE chunk_id = OLD.chunk_id AND status = 'ready'
+            );
+            UPDATE document_chunk_counts SET chunk_count = chunk_count - 1
+            WHERE document_id = OLD.document_id;
+        """
+        add_chunk = """
+            INSERT INTO document_chunk_counts(document_id, chunk_count)
+            VALUES (NEW.document_id, 1)
+            ON CONFLICT(document_id) DO UPDATE SET chunk_count = chunk_count + 1;
+            INSERT INTO document_index_ready_counts(index_version, document_id, ready_count)
+            SELECT index_version, NEW.document_id, 1 FROM embedding_jobs
+            WHERE chunk_id = NEW.chunk_id AND status = 'ready'
+            ON CONFLICT(index_version, document_id)
+            DO UPDATE SET ready_count = ready_count + 1;
+        """
+        for statement in (
+            "CREATE TRIGGER chunks_readiness_insert AFTER INSERT ON chunks BEGIN {} END".format(add_chunk),
+            "CREATE TRIGGER chunks_readiness_delete BEFORE DELETE ON chunks BEGIN {} END".format(remove_chunk),
+            "CREATE TRIGGER chunks_readiness_update_before BEFORE UPDATE OF chunk_id, document_id ON chunks "
+            "WHEN OLD.chunk_id IS NOT NEW.chunk_id OR OLD.document_id IS NOT NEW.document_id "
+            "BEGIN {} END".format(remove_chunk),
+            "CREATE TRIGGER chunks_readiness_update_after AFTER UPDATE OF chunk_id, document_id ON chunks "
+            "WHEN OLD.chunk_id IS NOT NEW.chunk_id OR OLD.document_id IS NOT NEW.document_id "
+            "BEGIN {} END".format(add_chunk),
+            """
+            CREATE TRIGGER jobs_readiness_insert AFTER INSERT ON embedding_jobs
+            WHEN NEW.status = 'ready' BEGIN
+                INSERT INTO document_index_ready_counts(index_version, document_id, ready_count)
+                SELECT NEW.index_version, document_id, 1 FROM chunks
+                WHERE chunk_id = NEW.chunk_id
+                ON CONFLICT(index_version, document_id)
+                DO UPDATE SET ready_count = ready_count + 1;
+            END
+            """,
+            """
+            CREATE TRIGGER jobs_readiness_delete AFTER DELETE ON embedding_jobs
+            WHEN OLD.status = 'ready' BEGIN
+                UPDATE document_index_ready_counts SET ready_count = ready_count - 1
+                WHERE index_version = OLD.index_version
+                  AND document_id = (SELECT document_id FROM chunks WHERE chunk_id = OLD.chunk_id);
+            END
+            """,
+            """
+            CREATE TRIGGER jobs_readiness_update AFTER UPDATE OF chunk_id, index_version, status ON embedding_jobs
+            BEGIN
+                UPDATE document_index_ready_counts SET ready_count = ready_count - 1
+                WHERE OLD.status = 'ready' AND index_version = OLD.index_version
+                  AND document_id = (SELECT document_id FROM chunks WHERE chunk_id = OLD.chunk_id);
+                INSERT INTO document_index_ready_counts(index_version, document_id, ready_count)
+                SELECT NEW.index_version, document_id, 1 FROM chunks
+                WHERE NEW.status = 'ready' AND chunk_id = NEW.chunk_id
+                ON CONFLICT(index_version, document_id)
+                DO UPDATE SET ready_count = ready_count + 1;
+            END
+            """,
+        ):
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 6")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def initialize_database(config: ProjectConfig) -> Path:
     """Create the ScriptLab database and its initial schema if needed."""
     roots = _configured_roots(config)
@@ -613,7 +740,7 @@ def _vector_status(connection: sqlite3.Connection) -> Dict[str, object]:
         "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at DESC LIMIT 1"
     ).fetchone()
     documents_with_chunks = connection.execute(
-        "SELECT COUNT(DISTINCT document_id) FROM chunks"
+        "SELECT COUNT(*) FROM document_chunk_counts WHERE chunk_count > 0"
     ).fetchone()[0]
     if indexed is None:
         return {
@@ -644,18 +771,8 @@ def _vector_status(connection: sqlite3.Connection) -> Dict[str, object]:
     documents_ready = connection.execute(
         """
         SELECT COUNT(*) FROM documents AS d
-        WHERE EXISTS (SELECT 1 FROM chunks WHERE document_id = d.document_id)
-          AND d.document_id NOT IN (
-              SELECT c.document_id
-              FROM chunks AS c
-              JOIN (
-                  SELECT chunk_id FROM chunks
-                  EXCEPT
-                  SELECT chunk_id FROM embedding_jobs
-                  WHERE index_version = ? AND status = 'ready'
-              ) AS missing ON missing.chunk_id IS c.chunk_id
-          )
-        """,
+        WHERE {}
+        """.format(_READY_DOCUMENT_SQL),
         (version,),
     ).fetchone()[0]
     return {
@@ -680,6 +797,7 @@ def search_chunks(
     limit: int = 10,
     ready_index_version: Optional[str] = None,
     require_all_terms: bool = True,
+    timings: Optional[SearchTimings] = None,
 ) -> List[Dict[str, object]]:
     """Search committed chunks with FTS5 and return exact source spans."""
     if source_class not in ("canonical", "fanfiction", "both"):
@@ -706,18 +824,7 @@ def search_chunks(
         conditions.append("d.work_id = ?")
         parameters.append(work_id)
     if ready_index_version is not None:
-        conditions.append(
-            "EXISTS (SELECT 1 FROM embedding_jobs AS j "
-            "WHERE j.chunk_id = c.chunk_id AND j.index_version = ? "
-            "AND j.status = 'ready')"
-        )
-        parameters.append(ready_index_version)
-        conditions.append(
-            "NOT EXISTS (SELECT 1 FROM chunks AS c2 "
-            "LEFT JOIN embedding_jobs AS j2 ON j2.chunk_id = c2.chunk_id "
-            "AND j2.index_version = ? WHERE c2.document_id = d.document_id "
-            "AND (j2.status IS NULL OR j2.status != 'ready'))"
-        )
+        conditions.append(_READY_DOCUMENT_SQL)
         parameters.append(ready_index_version)
     parameters.append(limit)
 
@@ -735,8 +842,12 @@ def search_chunks(
 
     results: List[Dict[str, object]] = []
     with _connection(config, _configured_roots(config)) as connection:
-        rows = connection.execute(sql, parameters).fetchall()
-        results.extend(_format_chunk_rows(connection, rows))
+        with measure(timings, "fts.sql"):
+            rows = connection.execute(sql, parameters).fetchall()
+        with measure(timings, "fts.citations"):
+            results.extend(_format_chunk_rows(connection, rows))
+    if timings is not None:
+        timings.increment("fts.candidates", len(results))
     return results
 
 
@@ -800,10 +911,14 @@ def search_chunks_by_ids(
     source_class: str,
     work_id: Optional[str],
     index_version: str,
+    limit: Optional[int] = None,
+    timings: Optional[SearchTimings] = None,
 ) -> List[Dict[str, object]]:
     """Resolve vector candidates through SQLite and keep only ready documents."""
     if source_class not in ("canonical", "fanfiction", "both"):
         raise ValueError("source_class must be canonical, fanfiction, or both")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be greater than zero")
     ordered_ids = list(dict.fromkeys(chunk_ids))
     if not ordered_ids:
         return []
@@ -813,10 +928,7 @@ def search_chunks_by_ids(
         "EXISTS (SELECT 1 FROM embedding_jobs AS j "
         "WHERE j.chunk_id = c.chunk_id AND j.index_version = ? "
         "AND j.status = 'ready')",
-        "NOT EXISTS (SELECT 1 FROM chunks AS c2 "
-        "LEFT JOIN embedding_jobs AS j2 ON j2.chunk_id = c2.chunk_id "
-        "AND j2.index_version = ? WHERE c2.document_id = d.document_id "
-        "AND (j2.status IS NULL OR j2.status != 'ready'))",
+        _READY_DOCUMENT_SQL,
     ]
     parameters: List[object] = list(ordered_ids)
     parameters.extend((index_version, index_version))
@@ -840,10 +952,17 @@ def search_chunks_by_ids(
     """.format(" AND ".join(conditions))
 
     with _connection(config, _configured_roots(config)) as connection:
-        rows = connection.execute(sql, parameters).fetchall()
-        rows_by_id = {row["chunk_id"]: row for row in rows}
-        ordered_rows = [rows_by_id[chunk_id] for chunk_id in ordered_ids if chunk_id in rows_by_id]
-        return _format_chunk_rows(connection, ordered_rows)
+        with measure(timings, "vector.sqlite_lookup"):
+            rows = connection.execute(sql, parameters).fetchall()
+            rows_by_id = {row["chunk_id"]: row for row in rows}
+            ordered_rows = [rows_by_id[chunk_id] for chunk_id in ordered_ids if chunk_id in rows_by_id]
+            if limit is not None:
+                ordered_rows = ordered_rows[:limit]
+        with measure(timings, "vector.citations"):
+            results = _format_chunk_rows(connection, ordered_rows)
+        if timings is not None:
+            timings.increment("vector.validated_candidates", len(results))
+        return results
 
 
 def validate_database(config: ProjectConfig) -> Dict[str, object]:

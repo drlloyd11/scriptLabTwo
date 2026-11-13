@@ -15,11 +15,13 @@ from scriptlab.config import ProjectConfig
 from scriptlab.corpus import _assert_path_has_no_reparse_components
 from scriptlab.database import (
     PersistenceError,
+    _READY_DOCUMENT_SQL,
     _configured_roots,
     _connection,
     get_status,
     search_chunks_by_ids,
 )
+from scriptlab.timing import SearchTimings, measure
 
 _MAX_CONSECUTIVE_BATCH_FAILURES = 3
 
@@ -387,15 +389,8 @@ def _index_counts(connection, index_version: str) -> Tuple[int, int, int, int]:
     documents_ready = connection.execute(
         """
         SELECT COUNT(*) FROM documents AS d
-        WHERE EXISTS (SELECT 1 FROM chunks WHERE document_id = d.document_id)
-          AND NOT EXISTS (
-              SELECT 1 FROM chunks AS c
-              LEFT JOIN embedding_jobs AS j
-                ON j.chunk_id = c.chunk_id AND j.index_version = ?
-              WHERE c.document_id = d.document_id
-                AND (j.status IS NULL OR j.status != 'ready')
-          )
-        """,
+        WHERE {}
+        """.format(_READY_DOCUMENT_SQL),
         (index_version,),
     ).fetchone()[0]
     return expected, ready, failed, documents_ready
@@ -699,6 +694,7 @@ def search_vector_chunks(
     limit: int = 10,
     embedding_provider: Optional[EmbeddingProvider] = None,
     collection_factory: Optional[Callable[..., VectorCollection]] = None,
+    timings: Optional[SearchTimings] = None,
 ) -> Dict[str, object]:
     """Search Chroma candidates, then validate their provenance in SQLite."""
     if source_class not in ("canonical", "fanfiction", "both"):
@@ -708,7 +704,8 @@ def search_vector_chunks(
     if limit < 1:
         raise ValueError("limit must be greater than zero")
 
-    status = get_status(config)
+    with measure(timings, "vector.status"):
+        status = get_status(config)
     vector_status = status["vector_index"]
     documents_total = status["documents"]
     documents_ready = vector_status["documents_ready"]
@@ -726,19 +723,22 @@ def search_vector_chunks(
         )
 
     index_version = vector_status["index_version"]
-    collection = (collection_factory or ChromaVectorCollection)(
-        config,
-        vector_status["collection_name"],
-        vector_status["embedding_model"],
-        index_version,
-    )
-    total_vectors = collection.count()
+    with measure(timings, "vector.collection_open"):
+        collection = (collection_factory or ChromaVectorCollection)(
+            config,
+            vector_status["collection_name"],
+            vector_status["embedding_model"],
+            index_version,
+        )
+    with measure(timings, "vector.collection_count"):
+        total_vectors = collection.count()
     if not total_vectors:
         raise VectorIndexError("The active vector collection is empty.")
     provider = embedding_provider or OllamaEmbeddingProvider(
         config.embedding_model, config.ollama_url
     )
-    query_embedding = _validate_embeddings(provider.embed([query]), 1)[0]
+    with measure(timings, "vector.embedding"):
+        query_embedding = _validate_embeddings(provider.embed([query]), 1)[0]
 
     filters: List[Dict[str, object]] = []
     if source_class != "both":
@@ -754,15 +754,24 @@ def search_vector_chunks(
     candidate_limit = min(total_vectors, max(limit * 10, limit))
     resolved: List[Dict[str, object]] = []
     while True:
-        candidates = collection.query(query_embedding, candidate_limit, where=where)
+        if timings is not None:
+            timings.increment("vector.query_calls")
+            timings.increment("vector.requested_candidates", candidate_limit)
+        with measure(timings, "vector.query"):
+            candidates = collection.query(query_embedding, candidate_limit, where=where)
+        if timings is not None:
+            timings.increment("vector.returned_candidates", len(candidates))
         candidate_ids = [chunk_id for chunk_id, _ in candidates]
-        validated = search_chunks_by_ids(
-            config,
-            candidate_ids,
-            source_class,
-            work_id,
-            index_version,
-        )
+        with measure(timings, "vector.validation"):
+            validated = search_chunks_by_ids(
+                config,
+                candidate_ids,
+                source_class,
+                work_id,
+                index_version,
+                limit=limit,
+                timings=timings,
+            )
         validated_by_id = {item["chunk_id"]: item for item in validated}
         resolved = []
         for rank, (chunk_id, distance) in enumerate(candidates, start=1):

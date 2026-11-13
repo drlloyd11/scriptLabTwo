@@ -281,7 +281,7 @@ def test_unsupported_files_are_visible_in_status(tmp_path):
     assert "pdf" in issue["message"]
 
 
-def test_populated_v1_database_migrates_to_v5_without_losing_corpus(tmp_path):
+def test_populated_v1_database_migrates_to_v6_without_losing_corpus(tmp_path):
     config = make_config(tmp_path)
     database_path = create_populated_v1_database(config)
     original_documents = rows(
@@ -293,7 +293,7 @@ def test_populated_v1_database_migrates_to_v5_without_losing_corpus(tmp_path):
     initialize_database(config)
     initialize_database(config)
 
-    assert rows(database_path, "PRAGMA user_version") == [(5,)]
+    assert rows(database_path, "PRAGMA user_version") == [(6,)]
     assert rows(
         database_path,
         "SELECT document_id, source_class, source_path, raw_sha256, normalized_text "

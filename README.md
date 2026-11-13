@@ -83,7 +83,7 @@ changed bytes or a source-class change at an existing path are reported as
 conflicts and never overwrite stored text. Extraction recovery warnings are
 retained with each document. `status` displays saved work/document counts and
 per-file import issues.
-On first use, the database is upgraded from schema v1 to v5 in transactions;
+On first use, the database is upgraded from schema v1 to v6 in transactions;
 existing documents are preserved, and committed chunks are indexed in FTS5.
 `parse` populates scenes, dialogue turns,
 chunks, spans, and review warnings for all stored documents; pass a document ID
@@ -102,7 +102,11 @@ Both vector modes require a complete active index and query embeddings from the
 configured Ollama model. Vector IDs
 are resolved through SQLite, where source class, work, and full-document
 readiness are verified; incomplete documents are excluded and coverage is
-reported. Vector failures are errors by default. `--fallback-to-fts` explicitly
+reported. SQLite maintains per-document chunk and ready-job counts transactionally,
+so searches can check readiness without rescanning every chunk. These counts
+track SQLite jobs, not independent verification of Chroma contents.
+Use ScriptLab to modify its database; direct external writes are not supported.
+Vector failures are errors by default. `--fallback-to-fts` explicitly
 allows semantic or hybrid requests to run FTS instead, and output reports both
 the requested and actual modes. `validate` checks FTS consistency and
 reconstructs chunks from their ordered spans. `index` resumes Ollama embeddings
@@ -118,6 +122,17 @@ to semantic search and accepts the same search options as `search`. Enter
 `/quit` to exit; EOF also ends the session. Individual search errors are
 reported and the session continues. End and restart the session before
 reindexing or otherwise modifying the corpus or vector index.
+
+Add `--timings` to `search` or `search-session` to report per-query retrieval
+timings and candidate counts to stderr without changing search results. The
+retrieval total excludes configuration loading and printing results; nested
+stages overlap and should not be added together. Counts are totals across
+candidate-query retries. Example:
+
+```powershell
+scriptlab --config data\rebuild_2026-11-12\scriptlab.yaml search-session --mode hybrid --source fanfiction --limit 5 --timings
+```
+
 If extraction failures occur, the report is still written and `inventory`
 returns exit code 1. Unsafe folder layouts stop preflight with exit code 2
 before source files are read or a report is written.
