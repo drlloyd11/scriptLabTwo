@@ -1,5 +1,7 @@
 # ScriptLab
 
+The next iteration of scriptLabTwo.
+
 ScriptLab is a local prototype for searching a fictional-universe corpus while
 keeping canonical scripts and fanfiction distinct and preserving evidence for
 later citations.
