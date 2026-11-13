@@ -53,6 +53,64 @@ def test_search_arguments_are_parsed():
     assert args.limit == 5
 
 
+def test_search_session_reuses_search_options_for_multiple_queries(monkeypatch, capsys):
+    queries = iter(["first question", "-second question", "/quit"])
+    calls = []
+    monkeypatch.setattr("builtins.input", lambda prompt: next(queries))
+    monkeypatch.setattr(cli_module, "load_config", lambda path: object())
+
+    def fake_search(config, query, **kwargs):
+        calls.append((query, kwargs))
+        return {
+            "results": [],
+            "index_version": "test-version",
+            "coverage": {"documents_ready": 1, "documents_total": 1},
+        }
+
+    monkeypatch.setattr(cli_module, "search_vector_chunks", fake_search)
+
+    assert main(
+        ["search-session", "--source", "fanfiction", "--work-id", "work-123", "--limit", "5"]
+    ) == 0
+    assert [query for query, _ in calls] == ["first question", "-second question"]
+    assert all(
+        options == {"source_class": "fanfiction", "work_id": "work-123", "limit": 5}
+        for _, options in calls
+    )
+    assert capsys.readouterr().out.count("requested_mode=semantic; actual_mode=semantic") == 2
+
+
+def test_search_session_reports_failure_and_continues_until_eof(monkeypatch, capsys):
+    queries = iter(["first question", "second question"])
+    calls = []
+
+    def read_query(prompt):
+        try:
+            return next(queries)
+        except StopIteration:
+            raise EOFError
+
+    def fake_search(config, query, **kwargs):
+        calls.append(query)
+        if len(calls) == 1:
+            raise VectorIndexError("synthetic vector outage")
+        return {
+            "results": [],
+            "index_version": "test-version",
+            "coverage": {"documents_ready": 1, "documents_total": 1},
+        }
+
+    monkeypatch.setattr("builtins.input", read_query)
+    monkeypatch.setattr(cli_module, "load_config", lambda path: object())
+    monkeypatch.setattr(cli_module, "search_vector_chunks", fake_search)
+
+    assert main(["search-session"]) == 1
+    assert calls == ["first question", "second question"]
+    output = capsys.readouterr()
+    assert "synthetic vector outage" in output.err
+    assert "requested_mode=semantic; actual_mode=semantic" in output.out
+
+
 def test_rrf_combines_ranked_results_and_deduplicates_chunks():
     fts_results = [{"chunk_id": "shared"}, {"chunk_id": "fts-only"}]
     vector_results = [{"chunk_id": "shared"}, {"chunk_id": "vector-only"}]

@@ -43,6 +43,24 @@ def _reciprocal_rank_fusion(fts_results, vector_results, limit: int, rank_consta
     return results
 
 
+def _add_search_options(parser: argparse.ArgumentParser, default_mode: str) -> None:
+    parser.add_argument(
+        "--mode", choices=("fts", "semantic", "hybrid"), default=default_mode
+    )
+    parser.add_argument(
+        "--source",
+        choices=("canonical", "fanfiction", "both"),
+        default="canonical",
+    )
+    parser.add_argument("--work-id")
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument(
+        "--fallback-to-fts",
+        action="store_true",
+        help="explicitly use keyword search if semantic search is unavailable",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scriptlab",
@@ -106,21 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     search_parser = commands.add_parser("search", help="search the local corpus")
     search_parser.add_argument("query", help="search query")
-    search_parser.add_argument(
-        "--mode", choices=("fts", "semantic", "hybrid"), default="fts"
+    _add_search_options(search_parser, default_mode="fts")
+    session_parser = commands.add_parser(
+        "search-session", help="search repeatedly in one local process"
     )
-    search_parser.add_argument(
-        "--source",
-        choices=("canonical", "fanfiction", "both"),
-        default="canonical",
-    )
-    search_parser.add_argument("--work-id")
-    search_parser.add_argument("--limit", type=int, default=10)
-    search_parser.add_argument(
-        "--fallback-to-fts",
-        action="store_true",
-        help="explicitly use keyword search if semantic search is unavailable",
-    )
+    _add_search_options(session_parser, default_mode="semantic")
 
     return parser
 
@@ -365,11 +373,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         return 1 if any(issue["status"] in ("failed", "conflict") for issue in status["issues"]) else 0
 
-    if args.command == "search":
+    if args.command in ("search", "search-session"):
         if args.limit < 1:
             parser.error("--limit must be greater than zero.")
         if args.mode == "fts" and args.fallback_to_fts:
             parser.error("--fallback-to-fts applies only to semantic or hybrid search.")
+
+        if args.command == "search-session":
+            print("Enter a search query, or /quit to exit.")
+            search_options = [
+                "--config", str(args.config), "search",
+                "--mode", args.mode,
+                "--source", args.source,
+                "--limit", str(args.limit),
+            ]
+            if args.work_id is not None:
+                search_options.extend(("--work-id", args.work_id))
+            if args.fallback_to_fts:
+                search_options.append("--fallback-to-fts")
+            exit_code = 0
+            while True:
+                try:
+                    query = input("Search> ")
+                except EOFError:
+                    print()
+                    return exit_code
+                except KeyboardInterrupt:
+                    print()
+                    return 130
+                if query.strip() == "/quit":
+                    return exit_code
+                if not query.strip():
+                    print("Enter a non-empty search query.", file=sys.stderr)
+                    continue
+                if main(search_options + ["--", query]) != 0:
+                    exit_code = 1
 
         actual_mode = args.mode
         coverage = None

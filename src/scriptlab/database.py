@@ -645,12 +645,15 @@ def _vector_status(connection: sqlite3.Connection) -> Dict[str, object]:
         """
         SELECT COUNT(*) FROM documents AS d
         WHERE EXISTS (SELECT 1 FROM chunks WHERE document_id = d.document_id)
-          AND NOT EXISTS (
-              SELECT 1 FROM chunks AS c
-              LEFT JOIN embedding_jobs AS j
-                ON j.chunk_id = c.chunk_id AND j.index_version = ?
-              WHERE c.document_id = d.document_id
-                AND (j.status IS NULL OR j.status != 'ready')
+          AND d.document_id NOT IN (
+              SELECT c.document_id
+              FROM chunks AS c
+              JOIN (
+                  SELECT chunk_id FROM chunks
+                  EXCEPT
+                  SELECT chunk_id FROM embedding_jobs
+                  WHERE index_version = ? AND status = 'ready'
+              ) AS missing ON missing.chunk_id IS c.chunk_id
           )
         """,
         (version,),

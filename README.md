@@ -39,6 +39,7 @@ scriptlab preview "C:\Users\reven\kitten\Buffy shooting scripts\1x01.htm"
 scriptlab search "Giles argues with Buffy" --mode fts --source canonical
 scriptlab search "someone conceals a secret" --mode semantic --source canonical
 scriptlab search "Giles challenges Buffy" --mode hybrid --source both
+scriptlab search-session --mode semantic --source canonical
 scriptlab search "Watcher" --mode semantic --fallback-to-fts
 scriptlab validate
 scriptlab index --batch-size 16 --limit 100
@@ -110,6 +111,13 @@ Use `--limit` to process a bounded number of new vectors per run and repeat the
 command to resume. A `--retry-failed` run targets only failed jobs. A model
 change requires `--rebuild`, which stages a separate collection and keeps the
 active index until the replacement verifies.
+
+`search-session` accepts one query per line in the same process, allowing
+successive vector searches to reuse Chroma after its initial load. It defaults
+to semantic search and accepts the same search options as `search`. Enter
+`/quit` to exit; EOF also ends the session. Individual search errors are
+reported and the session continues. End and restart the session before
+reindexing or otherwise modifying the corpus or vector index.
 If extraction failures occur, the report is still written and `inventory`
 returns exit code 1. Unsafe folder layouts stop preflight with exit code 2
 before source files are read or a report is written.
